@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.DS_Store
+
+# Tauri build output and local installers are published through GitHub Releases.
+src-tauri/target/
+*.dmg
+*.exe
+
+# Keep personal and third-party audio outside the public source repository.
+public/audio/test.mp3
+public/audio/samples/manifest.json
+public/audio/samples/library/*
+!public/audio/samples/library/.gitkeep
+!public/audio/samples/library/README.md

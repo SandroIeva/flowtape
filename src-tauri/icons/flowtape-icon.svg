@@ -1,0 +1,19 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="base" x1="112" y1="96" x2="912" y2="928" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2A2A2A"/>
+      <stop offset="1" stop-color="#111111"/>
+    </linearGradient>
+    <linearGradient id="letter" x1="440" y1="254" x2="604" y2="768" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ECFFAA"/>
+      <stop offset="1" stop-color="#C8F45A"/>
+    </linearGradient>
+    <filter id="glow" x="245" y="143" width="534" height="738" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" rx="230" fill="url(#base)"/>
+  <rect x="26" y="26" width="972" height="972" rx="208" stroke="#FFFFFF" stroke-opacity=".08" stroke-width="3"/>
+  <text x="512" y="714" text-anchor="middle" font-family="Georgia, serif" font-size="650" font-style="italic" font-weight="700" fill="#D8FF6A" opacity=".22" filter="url(#glow)">f</text>
+  <text x="512" y="714" text-anchor="middle" font-family="Georgia, serif" font-size="650" font-style="italic" font-weight="700" fill="url(#letter)">f</text>
+</svg>
