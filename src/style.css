@@ -342,5 +342,5 @@ nav { display:flex; flex-direction:column; gap:7px; } nav button,.side-bottom>bu
 .landing-windows-icon { width:16px;height:16px;display:block;flex:0 0 auto;background:currentColor;mask:url("/windows-logo.svg") center / contain no-repeat;-webkit-mask:url("/windows-logo.svg") center / contain no-repeat; }
 .landing-v3-platforms .landing-windows-icon { color:#d9ff6a; }
 .landing-v3-windows .landing-windows-icon { width:19px;height:19px;color:#3e4920; }
-.landing-download-grid>a:last-child>span.landing-platform-circle { background:#ffffff2e; }
+.landing-download-grid>a:last-child>span.landing-platform-circle { background:#ffffff22; }
 .landing-download-grid>a:last-child .landing-platform-circle .landing-windows-icon { width:19px;height:19px;color:#d9ff6a;background:#d9ff6a; }
