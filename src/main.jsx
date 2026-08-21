@@ -1776,5 +1776,6 @@ function App() {
   </main>;
 }
 
-const showLandingPage = window.location.search.includes("landing") || window.location.hash === "#landing" || window.location.pathname === "/landing";
+const isHostedWebsite = /^https?:$/.test(window.location.protocol) && !["localhost", "127.0.0.1"].includes(window.location.hostname);
+const showLandingPage = isHostedWebsite || window.location.search.includes("landing") || window.location.hash === "#landing" || window.location.pathname === "/landing";
 createRoot(document.getElementById("root")).render(showLandingPage ? <FlowtapeLandingV2 /> : <App />);
