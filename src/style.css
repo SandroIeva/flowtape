@@ -323,3 +323,7 @@ nav { display:flex; flex-direction:column; gap:7px; } nav button,.side-bottom>bu
 .landing-v3-screenshot { width:100%;height:100%;margin:0;position:relative;z-index:1;border-radius:14px;overflow:hidden;box-shadow:0 28px 75px #53600d33;transform-origin:50% 15%;transition:transform .12s ease-out;will-change:transform; }
 .landing-v3-screenshot img { width:100%;height:100%;display:block;object-fit:cover; }
 .landing-v3-screenshot-wrap .landing-v3-stage-shadow { bottom:0;width:80%;height:22%; }
+
+/* Feature cards: the step number is the only visual marker */
+.landing-v3-features>div>span { width:36px;height:36px;border-radius:50%;background:#d8ff6a;color:#293019;display:grid;place-items:center;font:700 12px/1 "DM Mono",ui-monospace,monospace;letter-spacing:0; }
+.landing-v3-features>div>h2 { margin:24px 0 9px; }
