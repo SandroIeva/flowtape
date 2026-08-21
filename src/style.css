@@ -311,9 +311,9 @@ nav { display:flex; flex-direction:column; gap:7px; } nav button,.side-bottom>bu
 .landing-download-grid>a>span { width:38px;height:38px;border-radius:50%;background:#f6f4ea78;display:grid;place-items:center;font-size:19px;line-height:1; }
 .landing-download-grid>a:last-child>span { background:#ffffff17;color:#d8ff6a; }
 .landing-download-grid b { margin-top:27px;font-size:20px;letter-spacing:-.8px; }
-.landing-download-grid small { margin-top:7px;color:#545847;font-size:11px;line-height:1.45; }
+.landing-download-grid small { margin-top:7px;color:#545847;font-size:12px;line-height:1.45; }
 .landing-download-grid>a:last-child small { color:#b7baae; }
-.landing-download-grid em { margin-top:auto;display:flex;align-items:center;gap:4px;font-size:12px;font-style:normal;font-weight:700; }
+.landing-download-grid em { margin-top:auto;display:flex;align-items:center;gap:4px;font-size:13px;font-style:normal;font-weight:700; }
 @keyframes landing-overlay-in { from { opacity:0; } to { opacity:1; } }
 @keyframes landing-dialog-in { from { opacity:0;transform:translateY(14px) scale(.98); } to { opacity:1;transform:none; } }
 @media(max-width:720px){.landing-v3-platforms{gap:5px}.landing-v3-platforms button{width:88px;height:36px;padding:0;font-size:9px;gap:5px}.landing-v3-platforms button span{font-size:14px}.landing-v3-actions>button{min-height:45px;padding:0 19px;font-size:12px}.landing-download-overlay{padding:15px}.landing-download-dialog{padding:31px 22px 22px;border-radius:21px}.landing-download-close{width:34px;height:34px;top:12px;right:12px}.landing-download-dialog h2{letter-spacing:-2px}.landing-download-grid{grid-template-columns:1fr}.landing-download-grid>a{min-height:168px}.landing-download-grid b{margin-top:18px}}
