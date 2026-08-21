@@ -337,3 +337,9 @@ nav { display:flex; flex-direction:column; gap:7px; } nav button,.side-bottom>bu
 .landing-v3-actions>button>span { display:flex;align-items:center;gap:6px;transform:translateX(3px); }
 .landing-v3-download-section h2 em { color:#777b6f;letter-spacing:-2.8px;font-family:"Bitter",Georgia,serif;font-weight:500;font-style:italic; }
 .landing-v3-hero h1 em { font-family:"Bitter",Georgia,serif;font-weight:500;font-style:italic; }
+
+/* Official Windows mark supplied for Flowtape */
+.landing-windows-icon { width:16px;height:16px;display:block;flex:0 0 auto;background:currentColor;mask:url("/windows-logo.svg") center / contain no-repeat;-webkit-mask:url("/windows-logo.svg") center / contain no-repeat; }
+.landing-v3-platforms .landing-windows-icon { color:#d9ff6a; }
+.landing-v3-windows .landing-windows-icon { width:19px;height:19px;color:#3e4920; }
+.landing-download-grid>a:last-child>span.landing-windows-icon { width:19px;height:19px;color:#d9ff6a;background:#d9ff6a; }
