@@ -333,3 +333,5 @@ nav { display:flex; flex-direction:column; gap:7px; } nav button,.side-bottom>bu
 .landing-v3-platforms button span { color:#d9ff6a; }
 .landing-v3-platforms button:last-child span { transform:translateY(-1px); }
 .landing-v3-hero h1 em { display:inline-block;transform:translateY(-4px); }
+.landing-v3-platforms { transform:translateY(2px); }
+.landing-v3-actions>button>span { display:flex;align-items:center;gap:6px;transform:translateX(3px); }
