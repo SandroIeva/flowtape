@@ -344,3 +344,4 @@ nav { display:flex; flex-direction:column; gap:7px; } nav button,.side-bottom>bu
 .landing-v3-windows .landing-windows-icon { width:19px;height:19px;color:#3e4920; }
 .landing-download-grid>a:last-child>span.landing-platform-circle { background:#ffffff22; }
 .landing-download-grid>a:last-child .landing-platform-circle .landing-windows-icon { width:19px;height:19px;color:#d9ff6a;background:#d9ff6a; }
+.landing-download-grid>a:first-child>span { background:#f6f4ea90; }
