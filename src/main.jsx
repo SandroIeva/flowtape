@@ -2,8 +2,10 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Mp3Encoder } from "@breezystack/lamejs";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
-  ArrowDownToLine, ChevronDown, ChevronLeft, ChevronRight,
+  ArrowDownToLine, ChevronDown, ChevronLeft, ChevronRight, LoaderCircle,
   Command, Download, FolderOpen, GripVertical, Headphones, Heart, Layers,
   Copy, Library, ListMusic, Mic, MoreHorizontal, Music2, Pause, Plus, Redo2, Repeat2, Scissors, SkipBack,
   Pencil, Search, SlidersHorizontal, Sparkles, Trash2, Undo2, Upload, Volume2, Wand2,
@@ -20,6 +22,34 @@ const readAudioAsBase64 = (file) => new Promise((resolve, reject) => {
   reader.onload = () => resolve(String(reader.result || "").split(",")[1] || "");
   reader.readAsDataURL(file);
 });
+const decodeAudioBlob = async (blob) => {
+  const Context = window.AudioContext || window.webkitAudioContext;
+  if (!Context) throw new Error("Audio decoding is not supported");
+  const context = new Context();
+  try {
+    const audioBuffer = await context.decodeAudioData(await blob.arrayBuffer());
+    const mono = new Float32Array(audioBuffer.length);
+    for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
+      const source = audioBuffer.getChannelData(channel);
+      for (let index = 0; index < source.length; index += 1) mono[index] += source[index] / audioBuffer.numberOfChannels;
+    }
+    return { samples: mono, sampleRate: audioBuffer.sampleRate };
+  } finally { await context.close().catch(() => {}); }
+};
+const resampleMonoAudio = (samples, sourceRate, targetRate = 16000) => {
+  if (sourceRate === targetRate) return samples;
+  const targetLength = Math.max(1, Math.round(samples.length * targetRate / sourceRate));
+  const resampled = new Float32Array(targetLength);
+  const ratio = sourceRate / targetRate;
+  for (let index = 0; index < targetLength; index += 1) {
+    const position = index * ratio;
+    const lower = Math.floor(position);
+    const upper = Math.min(samples.length - 1, lower + 1);
+    const fraction = position - lower;
+    resampled[index] = (samples[lower] || 0) * (1 - fraction) + (samples[upper] || 0) * fraction;
+  }
+  return resampled;
+};
 const persistAudioFile = async (file, collection) => {
   if (!isDesktopApp()) return { storedPath: "", url: URL.createObjectURL(file) };
   const storedPath = await invoke("store_audio", { fileName: file.name, dataBase64: await readAudioAsBase64(file), collection });
@@ -252,6 +282,30 @@ function FlowtapeLandingV2() {
   </main>;
 }
 
+const LOCAL_AI_CACHE_MODELS = {
+  lite: "onnx-community/Qwen2.5-0.5B-Instruct-ONNX",
+  standard: "onnx-community/Qwen3-0.6B-ONNX",
+  smart: "onnx-community/gemma-3-1b-it-ONNX",
+};
+
+// Transformers.js stores downloaded model shards in the browser Cache API.
+// Keep the active model only: switching models should not quietly consume disk
+// space with downloads the user is no longer using.
+async function clearUnusedLocalAiModels(activeModel) {
+  if (!("caches" in window)) return;
+  const keep = LOCAL_AI_CACHE_MODELS[activeModel] || LOCAL_AI_CACHE_MODELS.standard;
+  const knownModels = Object.values(LOCAL_AI_CACHE_MODELS);
+  const cacheNames = await window.caches.keys();
+  await Promise.all(cacheNames.map(async cacheName => {
+    const cache = await window.caches.open(cacheName);
+    const requests = await cache.keys();
+    await Promise.all(requests.map(request => {
+      const cachedModel = knownModels.find(modelId => request.url.includes(modelId));
+      return cachedModel && cachedModel !== keep ? cache.delete(request) : Promise.resolve(false);
+    }));
+  }));
+}
+
 function App() {
   const [playing, setPlaying] = useState(false);
   const [activeNav, setActiveNav] = useState("Studio");
@@ -259,6 +313,22 @@ function App() {
   const [solo, setSolo] = useState([]);
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState([{ role: "ai", text: "Hey! Ich bin bereit. Sag mir einfach, was du in deinem Mixtape verändern möchtest." }]);
+  const [localAiModel, setLocalAiModel] = useState(() => window.localStorage.getItem("flowtape-local-ai-model") || "standard");
+  const [localAiStatus, setLocalAiStatus] = useState(() => window.localStorage.getItem("flowtape-local-ai-enabled") === "true" ? "loading" : "idle");
+  const [localAiProgress, setLocalAiProgress] = useState(0);
+  const [localAiDevice, setLocalAiDevice] = useState("");
+  const [localAiRequest, setLocalAiRequest] = useState(null);
+  const [voiceAiStatus, setVoiceAiStatus] = useState("idle");
+  const [voiceAiProgress, setVoiceAiProgress] = useState(0);
+  const [pendingVoiceTranscript, setPendingVoiceTranscript] = useState("");
+  const [audioAnalysis, setAudioAnalysis] = useState(null);
+  const [analyzingAudio, setAnalyzingAudio] = useState(false);
+  const [mixCheck, setMixCheck] = useState(null);
+  const [matchingLevels, setMatchingLevels] = useState(false);
+  const [levelMatchPreview, setLevelMatchPreview] = useState(null);
+  const [availableUpdate, setAvailableUpdate] = useState(null);
+  const [updateStatus, setUpdateStatus] = useState("idle");
+  const [updateProgress, setUpdateProgress] = useState(0);
   const [toast, setToast] = useState("");
   const [imported, setImported] = useState([]);
   const [timelineClips, setTimelineClips] = useState(clips);
@@ -358,6 +428,15 @@ function App() {
   const draggedLibraryItemRef = useRef(null);
   const libraryPointerDragRef = useRef(null);
   const playheadPointerDragRef = useRef(false);
+  const localAiWorkerRef = useRef(null);
+  const localAiRequestIdRef = useRef(0);
+  const voiceAiWorkerRef = useRef(null);
+  const voiceRecorderRef = useRef(null);
+  const voiceChunksRef = useRef([]);
+  const voiceStreamRef = useRef(null);
+  const audioAnalysisWorkerRef = useRef(null);
+  const audioAnalysisClipRef = useRef(null);
+  const updateRef = useRef(null);
   const t = key => translate(appLanguage, key);
   const metronomeVolumeLabel = appLanguage === "de" ? "Lautstärke" : "Volume";
   const shortcutsCopy = appLanguage === "de" ? {
@@ -368,6 +447,50 @@ function App() {
     rows: [["Space", "Start or stop playback"], ["⌘ Z", "Undo the last edit"], ["+ / −", "Zoom the timeline in or out"], ["← / →", "Move the playhead in small steps"], ["⇧ + ← / →", "Move the playhead in large steps"], ["S", "Move the playhead to the start"], ["⌘ B", "Split the selected clip at the playhead"], ["⌫ / Del", "Delete the selected clip"]], close: "Done"
   };
   const notify = (text) => { setToast(text); window.setTimeout(() => setToast(""), 2400); };
+  const checkForUpdates = async (showNoUpdate = false) => {
+    if (!isDesktopApp()) return;
+    setUpdateStatus("checking");
+    try {
+      const update = await check();
+      if (!update) {
+        setUpdateStatus("idle");
+        if (showNoUpdate) notify(appLanguage === "de" ? "Flowtape ist auf dem neuesten Stand" : "Flowtape is up to date");
+        return;
+      }
+      updateRef.current = update;
+      setAvailableUpdate({ version: update.version, notes: update.body || "" });
+      setUpdateStatus("available");
+    } catch (error) {
+      console.info("Update check skipped", error);
+      setUpdateStatus("idle");
+      if (showNoUpdate) notify(appLanguage === "de" ? "Updates konnten gerade nicht geprüft werden" : "Updates could not be checked right now");
+    }
+  };
+  const installAvailableUpdate = async () => {
+    const update = updateRef.current;
+    if (!update) return;
+    setUpdateStatus("downloading");
+    setUpdateProgress(0);
+    let downloaded = 0;
+    let total = 0;
+    try {
+      await update.downloadAndInstall(event => {
+        if (event.event === "Started") total = Number(event.data.contentLength || 0);
+        if (event.event === "Progress") {
+          downloaded += Number(event.data.chunkLength || 0);
+          if (total > 0) setUpdateProgress(Math.min(100, Math.round((downloaded / total) * 100)));
+        }
+        if (event.event === "Finished") setUpdateProgress(100);
+      });
+      setUpdateStatus("installed");
+      notify(appLanguage === "de" ? "Update installiert – Flowtape startet neu" : "Update installed – restarting Flowtape");
+      await relaunch();
+    } catch (error) {
+      console.error("Update installation failed", error);
+      setUpdateStatus("available");
+      notify(appLanguage === "de" ? "Das Update konnte nicht installiert werden" : "The update could not be installed");
+    }
+  };
   const changeTempo = (value) => setBpm(Math.max(40, Math.min(240, Math.round(Number(value) || 40))));
   const toggleMetronome = () => {
     const next = !metronomeEnabled;
@@ -399,6 +522,11 @@ function App() {
     }));
   }, [appLanguage]);
   useEffect(() => { window.localStorage.setItem("flowtape-default-tracks", String(defaultTrackCount)); }, [defaultTrackCount]);
+  useEffect(() => {
+    if (!isDesktopApp()) return undefined;
+    const timer = window.setTimeout(() => { checkForUpdates(false); }, 2200);
+    return () => window.clearTimeout(timer);
+  }, []);
   useEffect(() => { window.localStorage.setItem("flowtape-export-formats", JSON.stringify(exportFormat)); }, [exportFormat]);
   useEffect(() => {
     const storable = projects.map(project => {
@@ -757,35 +885,242 @@ function App() {
       audio.load();
     });
   }, [imported]);
-  const submitPrompt = (value = prompt) => {
-    if (!value.trim()) return;
-    const reply = executeAssistantCommand(value);
-    setMessages(m => [...m, { role: "user", text: value }, { role: "ai", text: reply }]);
-    setPrompt("");
-  };
-  const startVoiceInput = () => {
-    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!Recognition) { notify("Spracherkennung wird von diesem Browser nicht unterstützt"); return; }
-    if (listening) { recognitionRef.current?.stop(); return; }
-    const recognition = new Recognition();
-    recognitionRef.current = recognition;
-    recognition.lang = "de-DE";
-    recognition.interimResults = false;
-    recognition.continuous = false;
-    let submitted = false;
-    recognition.onstart = () => setListening(true);
-    recognition.onresult = (event) => {
-      const result = event.results[event.results.length - 1];
-      const transcript = result?.[0]?.transcript?.trim();
-      if (result?.isFinal && transcript && !submitted) {
-        submitted = true;
-        setPrompt(transcript);
-        submitPrompt(transcript);
+  useEffect(() => {
+    window.localStorage.setItem("flowtape-local-ai-model", localAiModel);
+  }, [localAiModel]);
+  useEffect(() => {
+    // Removes only model assets belonging to Flowtape's other local AI choices.
+    // Voice recognition and the currently selected model stay untouched.
+    void clearUnusedLocalAiModels(localAiModel);
+  }, [localAiModel]);
+  useEffect(() => {
+    const worker = new Worker(new URL("./flow-ai.worker.js", import.meta.url), { type: "module" });
+    localAiWorkerRef.current = worker;
+    worker.onmessage = ({ data }) => {
+      if (data?.type === "progress") {
+        const total = Number(data.progress?.total || 0);
+        const loaded = Number(data.progress?.loaded || 0);
+        if (total > 0) setLocalAiProgress(Math.min(100, Math.round((loaded / total) * 100)));
+        return;
+      }
+      if (data?.type === "status") {
+        setLocalAiStatus(data.status);
+        if (data.device) setLocalAiDevice(data.device);
+        if (data.status === "ready") {
+          setLocalAiProgress(100);
+          window.localStorage.setItem("flowtape-local-ai-enabled", "true");
+        }
+        if (data.status === "error") notify(appLanguage === "de" ? "Lokales Modell konnte nicht geladen werden" : "The local model could not be loaded");
+        return;
+      }
+      if (data?.type === "result") setLocalAiRequest(current => current?.id === data.requestId ? { ...current, result: data.raw, error: data.error } : current);
+    };
+    // The model itself remains in the browser cache. On later page opens we
+    // simply recreate the worker from that cache instead of asking the user to
+    // download it again.
+    if (window.localStorage.getItem("flowtape-local-ai-enabled") === "true") worker.postMessage({ type: "load", model: localAiModel });
+    return () => worker.terminate();
+  }, []);
+  useEffect(() => {
+    const worker = new Worker(new URL("./flow-voice.worker.js", import.meta.url), { type: "module" });
+    voiceAiWorkerRef.current = worker;
+    worker.onmessage = ({ data }) => {
+      if (data?.type === "progress") {
+        const total = Number(data.progress?.total || 0);
+        const loaded = Number(data.progress?.loaded || 0);
+        if (total > 0) setVoiceAiProgress(Math.min(100, Math.round((loaded / total) * 100)));
+      } else if (data?.type === "status") {
+        setVoiceAiStatus(data.status);
+        if (data.status === "ready") setVoiceAiProgress(100);
+        if (data.status === "error") notify(appLanguage === "de" ? "Lokale Spracheingabe konnte nicht geladen werden" : "Local voice input could not be loaded");
+      } else if (data?.type === "result") {
+        if (data.error) notify(appLanguage === "de" ? "Die Aufnahme war nicht klar genug. Bitte sprich einen kurzen Befehl noch einmal ein." : "The recording was not clear enough. Please try a short command again.");
+        else if (data.text) setPendingVoiceTranscript(data.text);
       }
     };
-    recognition.onerror = () => { setListening(false); notify("Spracheingabe konnte nicht gestartet werden"); };
-    recognition.onend = () => setListening(false);
-    recognition.start();
+    return () => worker.terminate();
+  }, []);
+  useEffect(() => {
+    const worker = new Worker(new URL("./flow-audio-analysis.worker.js", import.meta.url), { type: "module" });
+    audioAnalysisWorkerRef.current = worker;
+    worker.onmessage = ({ data }) => {
+      setAnalyzingAudio(false);
+      if (data?.error) notify(appLanguage === "de" ? "Audioanalyse konnte nicht durchgeführt werden" : "Audio analysis could not be completed");
+      else if (data?.analysis) setAudioAnalysis({ ...data.analysis, clipId: audioAnalysisClipRef.current });
+    };
+    return () => worker.terminate();
+  }, []);
+  const submitPrompt = (value = prompt) => {
+    if (!value.trim()) return;
+    // Straightforward edit commands should not wait for the language model. This
+    // makes the common voice commands reliable even if a small local model
+    // returns malformed JSON.
+    if (/(schneid|teile|split|cut|fade.?out|ausblend|ausfaden|fade.?in|einblend|einfaden|verschieb|move|place|put|cross.?fade|overlap|überblend|ueberblend|überlapp|ueberlapp|übergang|uebergang|transition|blend|mute|\bmuh\b|stummschalt|unmute|solo|rückgängig|rueckgaengig|undo|redo|wiederhol|zoom|reinzoom|rauszoom|vergrößer|vergroesser|verkleiner|play|pause|abspiel|wiedergabe|anhalten|abspielkopf|playhead|zum anfang|go to start|delete|lösche|loesche|entfern|remove)/i.test(value)) {
+      const reply = executeAssistantCommand(value);
+      setMessages(m => [...m, { role: "user", text: value }, { role: "ai", text: reply }]);
+      setPrompt("");
+      return;
+    }
+    if (localAiStatus === "ready") {
+      const id = ++localAiRequestIdRef.current;
+      const selectedClip = selectedClipId ? timelineClips.find(clip => clip.id === selectedClipId) : null;
+      setMessages(m => [...m, { role: "user", text: value }, { role: "ai", text: appLanguage === "de" ? "Ich prüfe die Aktion lokal …" : "Checking that locally …", pending: id }]);
+      setLocalAiRequest({ id, prompt: value, result: null, error: null });
+      localAiWorkerRef.current?.postMessage({ type: "run", model: localAiModel, requestId: id, prompt: value, context: { projectDuration, playbackTime, selectedClip: selectedClip ? { id: selectedClip.id, label: selectedClip.label, track_number: selectedClip.track + 1, start: (selectedClip.start / 100) * projectDuration, end: ((selectedClip.start + selectedClip.width) / 100) * projectDuration } : null, clips: timelineClips.map(clip => ({ id: clip.id, label: clip.label, track_number: clip.track + 1, start: Math.round((clip.start / 100) * projectDuration * 100) / 100, end: Math.round(((clip.start + clip.width) / 100) * projectDuration * 100) / 100 })), tracks: trackList.map((track, index) => ({ number: index + 1, name: track.name })), recentConversation: messages.slice(-6).map(message => ({ role: message.role, text: message.text })).filter(message => !message.pending) } });
+    } else {
+      const reply = executeAssistantCommand(value);
+      const localHint = localAiStatus === "idle" ? (appLanguage === "de" ? " Aktiviere oben Local AI für zusätzliche lokale Sprachbefehle." : " Enable Local AI above for additional offline commands.") : "";
+      setMessages(m => [...m, { role: "user", text: value }, { role: "ai", text: `${reply}${localHint}` }]);
+    }
+    setPrompt("");
+  };
+  useEffect(() => {
+    if (!pendingVoiceTranscript) return;
+    submitPrompt(pendingVoiceTranscript);
+    setPendingVoiceTranscript("");
+  }, [pendingVoiceTranscript]);
+  const startVoiceInput = () => {
+    if (listening) { voiceRecorderRef.current?.stop(); return; }
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { notify(appLanguage === "de" ? "Audioaufnahme wird von diesem Browser nicht unterstützt" : "Audio recording is not supported by this browser"); return; }
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      voiceStreamRef.current = stream;
+      voiceChunksRef.current = [];
+      const mimeType = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find(type => MediaRecorder.isTypeSupported?.(type));
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      voiceRecorderRef.current = recorder;
+      recorder.ondataavailable = event => { if (event.data.size) voiceChunksRef.current.push(event.data); };
+      recorder.onerror = () => { stream.getTracks().forEach(track => track.stop()); setListening(false); notify(appLanguage === "de" ? "Die Aufnahme wurde unterbrochen" : "The recording was interrupted"); };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach(track => track.stop());
+        setListening(false);
+        try {
+          const audio = await decodeAudioBlob(new Blob(voiceChunksRef.current, { type: recorder.mimeType || mimeType || "audio/webm" }));
+          const samples = resampleMonoAudio(audio.samples, audio.sampleRate);
+          setVoiceAiStatus("loading");
+          setVoiceAiProgress(0);
+          voiceAiWorkerRef.current?.postMessage({ type: "transcribe", language: appLanguage, samples: samples.buffer }, [samples.buffer]);
+        } catch { setVoiceAiStatus("idle"); notify(appLanguage === "de" ? "Die Aufnahme konnte nicht verarbeitet werden. Bitte kurz erneut aufnehmen." : "The recording could not be processed. Please try recording again."); }
+      };
+      recorder.start();
+      setListening(true);
+    }).catch(() => notify(appLanguage === "de" ? "Mikrofonzugriff wurde nicht erlaubt" : "Microphone access was not allowed"));
+  };
+  const analyzeSelectedAudio = async () => {
+    const clip = selectedClipId ? timelineClips.find(item => item.id === selectedClipId) : null;
+    const audioItem = clip ? imported.find(item => item.id === clip.audioItemId) : null;
+    if (!audioItem?.url) { notify(appLanguage === "de" ? "Wähle zuerst einen Audio-Clip aus" : "Select an audio clip first"); return; }
+    setAnalyzingAudio(true);
+    setAudioAnalysis(null);
+    audioAnalysisClipRef.current = clip.id;
+    try {
+      const response = await fetch(audioItem.url);
+      if (!response.ok) throw new Error("Audio could not be read");
+      const audio = await decodeAudioBlob(await response.blob());
+      audioAnalysisWorkerRef.current?.postMessage({ type: "analyze", samples: audio.samples.buffer, sampleRate: audio.sampleRate }, [audio.samples.buffer]);
+    } catch {
+      setAnalyzingAudio(false);
+      notify(appLanguage === "de" ? "Die Audiodatei konnte nicht analysiert werden" : "The audio file could not be analysed");
+    }
+  };
+  const snapSelectedClipToBeat = () => {
+    const clip = selectedClipId ? timelineClips.find(item => item.id === selectedClipId) : null;
+    if (!clip) { notify(appLanguage === "de" ? "Wähle zuerst einen Audio-Clip aus" : "Select an audio clip first"); return; }
+    if (audioAnalysis?.clipId !== clip.id || !audioAnalysis.beatTimes?.length) {
+      notify(appLanguage === "de" ? "Analysiere zuerst genau diesen Clip" : "Analyse this exact clip first");
+      return;
+    }
+    const clipDuration = (clip.width / 100) * projectDuration;
+    const sourceStart = clip.sourceOffset || 0;
+    const sourceEnd = sourceStart + clipDuration;
+    const beatInSource = audioAnalysis.beatTimes.find(time => time >= sourceStart - .02 && time <= sourceEnd + .02);
+    if (!Number.isFinite(beatInSource)) { notify(appLanguage === "de" ? "In diesem Clip wurde kein eindeutiger Beat gefunden" : "No clear beat was found in this clip"); return; }
+    const beatInsideClip = Math.max(0, beatInSource - sourceStart);
+    const currentStartSeconds = (clip.start / 100) * projectDuration;
+    const gridInterval = 60 / bpm;
+    const targetBeat = Math.round((currentStartSeconds + beatInsideClip) / gridInterval) * gridInterval;
+    const requestedStart = Math.max(0, Math.min(100 - clip.width, ((targetBeat - beatInsideClip) / projectDuration) * 100));
+    const otherClips = timelineClips.filter(item => item.id !== clip.id && item.track === clip.track).sort((a, b) => a.start - b.start);
+    const freeRanges = [];
+    let cursor = 0;
+    otherClips.forEach(item => {
+      const rangeEnd = item.start - clip.width;
+      if (rangeEnd >= cursor) freeRanges.push([cursor, rangeEnd]);
+      cursor = Math.max(cursor, item.start + item.width);
+    });
+    if (cursor <= 100 - clip.width) freeRanges.push([cursor, 100 - clip.width]);
+    if (!freeRanges.length) { notify(appLanguage === "de" ? "Auf dieser Spur ist kein freier Platz zum Einrasten" : "There is no free space on this track to snap the clip"); return; }
+    const nextStart = freeRanges
+      .map(([from, to]) => Math.max(from, Math.min(to, requestedStart)))
+      .reduce((nearest, position) => Math.abs(position - requestedStart) < Math.abs(nearest - requestedStart) ? position : nearest);
+    recordHistory();
+    setSnapAnimatingClipId(clip.id);
+    setTimelineClips(current => current.map(item => item.id === clip.id ? { ...item, start: nextStart } : item));
+    window.setTimeout(() => setSnapAnimatingClipId(current => current === clip.id ? null : current), 260);
+    const beatLabel = formatTime(Math.max(0, (nextStart / 100) * projectDuration + beatInsideClip));
+    notify(appLanguage === "de" ? `Beat auf ${beatLabel} am ${bpm}-BPM-Raster ausgerichtet` : `Beat aligned to the ${bpm} BPM grid at ${beatLabel}`);
+  };
+  const previewLevelMatch = async () => {
+    const matchableClips = timelineClips.filter(clip => clip.audioItemId && !clip.recording && imported.some(item => item.id === clip.audioItemId));
+    if (matchableClips.length < 2) {
+      notify(appLanguage === "de" ? "Füge mindestens zwei Audio-Clips zur Timeline hinzu" : "Add at least two audio clips to the timeline");
+      return;
+    }
+    setMatchingLevels(true);
+    setLevelMatchPreview(null);
+    try {
+      const decodedAudio = new Map();
+      const results = (await Promise.all(matchableClips.map(async clip => {
+        const item = imported.find(candidate => candidate.id === clip.audioItemId);
+        if (!item?.url) return null;
+        let audio = decodedAudio.get(item.id);
+        if (!audio) {
+          const response = await fetch(item.url);
+          if (!response.ok) throw new Error("Audio could not be read");
+          audio = await decodeAudioBlob(await response.blob());
+          decodedAudio.set(item.id, audio);
+        }
+        const sourceStart = Math.max(0, Math.floor((clip.sourceOffset || 0) * audio.sampleRate));
+        const sourceLength = Math.max(1, Math.floor(((clip.width / 100) * projectDuration) * audio.sampleRate));
+        const sourceEnd = Math.min(audio.samples.length, sourceStart + sourceLength);
+        if (sourceEnd <= sourceStart) return null;
+        const step = Math.max(1, Math.ceil((sourceEnd - sourceStart) / 420000));
+        let energy = 0;
+        let count = 0;
+        for (let index = sourceStart; index < sourceEnd; index += step) {
+          const sample = audio.samples[index];
+          energy += sample * sample;
+          count += 1;
+        }
+        const loudnessDb = 20 * Math.log10(Math.max(0.000001, Math.sqrt(energy / Math.max(1, count))));
+        return { clipId: clip.id, label: clip.label, loudnessDb };
+      }))).filter(Boolean);
+      if (results.length < 2) throw new Error("Not enough readable clips");
+      const sortedLevels = results.map(result => result.loudnessDb).sort((a, b) => a - b);
+      const targetDb = sortedLevels.length % 2
+        ? sortedLevels[Math.floor(sortedLevels.length / 2)]
+        : (sortedLevels[sortedLevels.length / 2 - 1] + sortedLevels[sortedLevels.length / 2]) / 2;
+      const adjustments = results.map(result => {
+        const changeDb = Math.max(-9, Math.min(9, targetDb - result.loudnessDb));
+        return { ...result, changeDb, gain: Math.pow(10, changeDb / 20) };
+      });
+      setLevelMatchPreview({ targetDb, adjustments });
+    } catch {
+      notify(appLanguage === "de" ? "Die Lautstärken konnten nicht analysiert werden" : "The levels could not be analysed");
+    } finally {
+      setMatchingLevels(false);
+    }
+  };
+  const applyLevelMatch = () => {
+    if (!levelMatchPreview) return;
+    const adjustmentByClip = new Map(levelMatchPreview.adjustments.map(adjustment => [adjustment.clipId, adjustment]));
+    recordHistory();
+    setTimelineClips(current => current.map(clip => {
+      const adjustment = adjustmentByClip.get(clip.id);
+      if (!adjustment) return clip;
+      return { ...clip, gain: Math.max(.35, Math.min(1.6, (clip.gain ?? 1) * adjustment.gain)) };
+    }));
+    setLevelMatchPreview(null);
+    notify(appLanguage === "de" ? "Lautstärken der Clips wurden angeglichen" : "Clip levels were matched");
   };
   const importFiles = async (event) => {
     const files = Array.from(event.target.files || []).filter(file => file.type.startsWith("audio/"));
@@ -1354,7 +1689,7 @@ function App() {
       audio.preservesPitch = mickey === 0 && horror === 0;
       audio.webkitPreservesPitch = mickey === 0 && horror === 0;
       audio.loop = false;
-      audio.volume = Math.max(0, Math.min(1, volume * ((trackVolumes[clip.track] ?? 75) / 100)));
+      audio.volume = Math.max(0, Math.min(1, volume * ((trackVolumes[clip.track] ?? 75) / 100) * (clip.gain ?? 1)));
       const expectedTime = (clip.sourceOffset || 0) + clipPosition * playbackRate;
       const timelineJumped = player.lastTimelineTime === null || Math.abs(playbackTime - player.lastTimelineTime) > .15;
       if (timelineJumped && Number.isFinite(expectedTime)) audio.currentTime = expectedTime;
@@ -1374,6 +1709,52 @@ function App() {
     timelineAudioPlayers.current.clear();
   }, []);
   const setFade = (id, edge, value) => { recordHistory(); setFades(current => ({ ...current, [id]: { ...current[id], [edge]: Number(value) } })); };
+  const runMixCheck = () => {
+    const audioClips = timelineClips.filter(clip => clip.audioItemId && !clip.recording);
+    const suggestions = [];
+    if (!audioClips.length) {
+      suggestions.push({ id: "add-first-sound", kind: "tip", title: appLanguage === "de" ? "Starte mit einem Sound" : "Start with a sound", body: appLanguage === "de" ? "Ziehe einen Sound aus deiner Sammlung auf eine Spur. Danach kann ich Übergänge und Struktur prüfen." : "Drag a sound from your collection onto a track. Then I can check transitions and structure." });
+    }
+    trackList.forEach((track, trackIndex) => {
+      const clipsOnTrack = audioClips.filter(clip => clip.track === trackIndex).sort((a, b) => a.start - b.start);
+      for (let index = 0; index < clipsOnTrack.length - 1 && suggestions.length < 3; index += 1) {
+        const before = clipsOnTrack[index];
+        const after = clipsOnTrack[index + 1];
+        const gapPercent = after.start - (before.start + before.width);
+        const gapSeconds = (gapPercent / 100) * projectDuration;
+        if (gapSeconds > .35 && gapSeconds <= 16) {
+          suggestions.push({ id: `close-gap-${before.id}-${after.id}`, kind: "close-gap", beforeId: before.id, afterId: after.id, title: appLanguage === "de" ? "Lücke schließen" : "Close a gap", body: appLanguage === "de" ? `Zwischen „${before.label}“ und „${after.label}“ liegen ${formatTime(gapSeconds)} Stille.` : `There are ${formatTime(gapSeconds)} of silence between “${before.label}” and “${after.label}”.`, apply: appLanguage === "de" ? "Andocken" : "Snap together" });
+        } else if (gapSeconds >= -.01 && gapSeconds <= 1.2) {
+          const beforeDuration = (before.width / 100) * projectDuration;
+          const afterDuration = (after.width / 100) * projectDuration;
+          const fadeSeconds = Math.min(2, beforeDuration / 3, afterDuration / 3);
+          if (fadeSeconds >= .3) suggestions.push({ id: `soften-join-${before.id}-${after.id}`, kind: "soften-join", beforeId: before.id, afterId: after.id, fadeSeconds, title: appLanguage === "de" ? "Übergang weicher machen" : "Soften a transition", body: appLanguage === "de" ? `„${before.label}“ und „${after.label}“ liegen bereits nah beieinander. Ein kurzer Fade macht den Wechsel ruhiger.` : `“${before.label}” and “${after.label}” already sit close together. A short fade can make the change feel smoother.`, apply: appLanguage === "de" ? "Fades anwenden" : "Apply fades" });
+        }
+      }
+    });
+    if (!suggestions.length && audioClips.length) suggestions.push({ id: "mix-is-tidy", kind: "tip", title: appLanguage === "de" ? "Die Struktur ist sauber" : "Your structure is tidy", body: appLanguage === "de" ? `Ich sehe ${audioClips.length} Audio-Clip${audioClips.length === 1 ? "" : "s"} ohne kurze Lücken auf derselben Spur. Wähle einen Clip aus, wenn du ihn genauer analysieren möchtest.` : `I found ${audioClips.length} audio clip${audioClips.length === 1 ? "" : "s"} with no short gaps on the same track. Select a clip for a closer audio check.` });
+    setMixCheck({ suggestions: suggestions.slice(0, 3) });
+    setMessages(current => [...current, { role: "ai", text: appLanguage === "de" ? `Mix Check fertig: Ich habe ${suggestions.length} ${suggestions.length === 1 ? "Ansatz" : "Ansätze"} für deinen Mix gefunden.` : `Mix check complete: I found ${suggestions.length} ${suggestions.length === 1 ? "idea" : "ideas"} for your mix.` }]);
+  };
+  const applyMixSuggestion = (suggestion) => {
+    if (!suggestion?.kind || suggestion.kind === "tip") return;
+    const before = timelineClips.find(clip => clip.id === suggestion.beforeId);
+    const after = timelineClips.find(clip => clip.id === suggestion.afterId);
+    if (!before || !after) return;
+    recordHistory();
+    if (suggestion.kind === "close-gap") {
+      setTimelineClips(current => current.map(clip => clip.id === after.id ? { ...clip, start: before.start + before.width } : clip));
+      setSelectedClipId(after.id);
+    }
+    if (suggestion.kind === "soften-join") {
+      const beforeDuration = (before.width / 100) * projectDuration;
+      const afterDuration = (after.width / 100) * projectDuration;
+      setFades(current => ({ ...current, [before.id]: { ...current[before.id], out: Math.min(40, (suggestion.fadeSeconds / beforeDuration) * 100) }, [after.id]: { ...current[after.id], in: Math.min(40, (suggestion.fadeSeconds / afterDuration) * 100) } }));
+      setSelectedClipId(after.id);
+    }
+    setMixCheck(current => current ? { ...current, suggestions: current.suggestions.filter(item => item.id !== suggestion.id) } : current);
+    notify(appLanguage === "de" ? "Vorschlag angewendet" : "Suggestion applied");
+  };
   const openContextMenu = (event, clip) => {
     event.preventDefault();
     setSelectedClipId(clip.id);
@@ -1448,27 +1829,328 @@ function App() {
   const parseCommandTime = (text) => {
     const clock = text.match(/(\d{1,2})\s*[:.]\s*(\d{2})/);
     if (clock) return Number(clock[1]) * 60 + Number(clock[2]);
-    const spoken = text.match(/(\d+)\s*(?:minute|minuten|min)\s*(?:und\s*)?(\d+)?\s*(?:sekunde|sekunden|sek)?/i);
+    const spoken = text.match(/(\d+)\s*(?:minute|minuten|min|minutes?)\s*(?:und|and)?\s*(\d+)?\s*(?:sekunde|sekunden|sek|seconds?|secs?)?/i);
     if (spoken) return Number(spoken[1]) * 60 + Number(spoken[2] || 0);
-    const seconds = text.match(/(?:bei|an)\s*(\d+)\s*(?:sekunde|sekunden|sek)/i);
+    // Speech-to-text often inserts a comma: "at second, 56". Accept both
+    // word orders and harmless punctuation so spoken edit commands stay easy.
+    const seconds = text.match(/(?:bei|an|at|um)\s*(?:the\s*)?(?:sekunde|sekunden|sek|seconds?|secs?)(?:\s*(?:number|nummer|nr\.?))?\s*[,.:]?\s*(\d+)/i)
+      || text.match(/(?:bei|an|at|um)\s*(\d+)\s*(?:sekunde|sekunden|sek|seconds?|secs?)/i)
+      || text.match(/(?:bei|an|at|um)\s*(?:the\s*)?(?:sekunde|sekunden|sek|seconds?|secs?)?\s*(\d+)\s*(?:sekunde|sekunden|sek|seconds?|secs?)?/i);
     if (seconds) return Number(seconds[1]);
-    const bareSeconds = text.match(/(?:bei|an)\s*(\d+)(?:\s|$)/i);
+    // Whisper can add filler words around a number (for example: "at second
+    // I don't know 45"). The first number shortly after a time word is still
+    // the safest useful interpretation for a cut command.
+    const interruptedSeconds = text.match(/(?:sekunde|sekunden|sek|seconds?|secs?)(?:\D{1,28})(\d{1,3})(?:\D|$)/i);
+    if (interruptedSeconds) return Number(interruptedSeconds[1]);
+    const bareSeconds = text.match(/(?:bei|an|at)\s*(\d+)(?:\s|$)/i);
     return bareSeconds ? Number(bareSeconds[1]) : null;
+  };
+  const wordDistance = (first, second) => {
+    const rows = Array.from({ length: first.length + 1 }, (_, index) => [index]);
+    for (let column = 0; column <= second.length; column += 1) rows[0][column] = column;
+    for (let row = 1; row <= first.length; row += 1) {
+      for (let column = 1; column <= second.length; column += 1) {
+        rows[row][column] = first[row - 1] === second[column - 1]
+          ? rows[row - 1][column - 1]
+          : Math.min(rows[row - 1][column] + 1, rows[row][column - 1] + 1, rows[row - 1][column - 1] + 1);
+      }
+    }
+    return rows[first.length][second.length];
+  };
+  const findMentionedClip = (text) => {
+    const normalized = text.toLowerCase().replace(/[^a-z0-9äöüß]+/gi, " ").trim();
+    const spokenWords = normalized.split(/\s+/);
+    return timelineClips.find(clip => {
+      const words = clip.label.toLowerCase().replace(/[^a-z0-9äöüß]+/gi, " ").trim().split(/\s+/).filter(word => word.length > 2 && !/^\d+$/.test(word));
+      return words.length > 0 && words.every(word => normalized.includes(word) || spokenWords.some(spoken => word.length > 4 && spoken.length > 4 && wordDistance(word, spoken) <= 1));
+    });
+  };
+  const resolveSplitTarget = (text, time, preferredTrack = null) => {
+    const namedClip = findMentionedClip(text);
+    if (namedClip && (preferredTrack === null || namedClip.track === preferredTrack)) {
+      const start = (namedClip.start / 100) * projectDuration;
+      const duration = (namedClip.width / 100) * projectDuration;
+      // A named clip plus "at 35 seconds" naturally means 35 seconds into
+      // that clip. A clock time such as "at 1:20" remains a timeline position
+      // when it falls inside the referenced clip.
+      const explicitlyRelative = /(?:bei|an|at)\s*(?:the\s*)?(?:sekunde|sekunden|sek|seconds?|secs?)/i.test(text);
+      const targetTime = explicitlyRelative ? start + time : (time >= start && time <= start + duration ? time : start + time);
+      return targetTime > start && targetTime < start + duration ? { clip: namedClip, time: targetTime } : null;
+    }
+    const clip = timelineClips.find(item => {
+      const start = (item.start / 100) * projectDuration;
+      const end = ((item.start + item.width) / 100) * projectDuration;
+      return (preferredTrack === null || item.track === preferredTrack) && time > start && time < end;
+    });
+    return clip ? { clip, time } : null;
+  };
+  const parseMentionedTrackNumbers = (text) => {
+    const words = { first: 1, one: 1, erste: 1, eins: 1, second: 2, two: 2, zweite: 2, zwei: 2, third: 3, three: 3, free: 3, tree: 3, dritte: 3, drei: 3, fourth: 4, four: 4, vierte: 4, vier: 4 };
+    const values = [];
+    const pattern = /(?:track|spur|record)\s*(?:number\s*)?[,\s-]*(?:0?(\d{1,2})|(first|one|erste|eins|second|two|zweite|zwei|third|three|free|tree|dritte|drei|fourth|four|vierte|vier))/gi;
+    for (const match of text.matchAll(pattern)) {
+      const value = Number(match[1]) || words[match[2]?.toLowerCase()];
+      if (value && !values.includes(value)) values.push(value);
+    }
+    return values;
+  };
+  const parseTrackNumber = (text) => {
+    const names = { first: 1, one: 1, erste: 1, eins: 1, second: 2, two: 2, zweite: 2, zwei: 2, third: 3, three: 3, free: 3, tree: 3, dritte: 3, drei: 3, fourth: 4, four: 4, vierte: 4, vier: 4 };
+    const numeric = text.match(/(?:track|spur|record)s*(?:number\s*)?0?(\d{1,2})/i);
+    if (numeric) return Number(numeric[1]);
+    const word = text.match(/(?:track|spur|record)\s*(?:number\s*)?(first|one|erste|eins|second|two|zweite|zwei|third|three|free|tree|dritte|drei|fourth|four|vierte|vier)/i)
+      || text.match(/(?:to|auf|in)\s+(?:the\s+)?(first|one|erste|eins|second|two|zweite|zwei|third|three|free|tree|dritte|drei|fourth|four|vierte|vier)\s+(?:track|spur|record)/i);
+    return word ? names[word[1].toLowerCase()] : null;
+  };
+  const findCommandPartClip = (text) => {
+    const partNames = { first: 1, one: 1, erste: 1, eins: 1, second: 2, two: 2, zweite: 2, zwei: 2, third: 3, three: 3, dritte: 3, drei: 3 };
+    const partMatch = text.match(/(?:the\s+)?(first|one|erste|eins|second|two|zweite|zwei|third|three|dritte|drei|\d+)\s*(?:part|teil)/i);
+    const part = partMatch ? (Number(partMatch[1]) || partNames[partMatch[1].toLowerCase()]) : null;
+    if (part) {
+      const partClip = timelineClips.find(clip => new RegExp(`(?:·|part|teil)\\s*${part}(?:\\D|$)`, "i").test(clip.label));
+      if (partClip) return partClip;
+    }
+    return selectedClipId ? timelineClips.find(clip => clip.id === selectedClipId) : findMentionedClip(text);
+  };
+  const transitionDurationFromCommand = (text) => {
+    const match = text.match(/(?:für|for|over|über)\s*(\d+(?:[.,]\d+)?)\s*(?:sekunde|sekunden|sek|seconds?|secs?)/i);
+    return Math.max(.35, Math.min(8, Number(String(match?.[1] || "1.5").replace(",", ".")) || 1.5));
+  };
+  const clipBaseLabel = (label) => String(label || "").replace(/\s*(?:·|\-|–)?\s*(?:(?:part|teil)\s*)?\d+\s*$/i, "").trim().toLowerCase();
+  const findTransitionPair = (text) => {
+    const requestedPart = findCommandPartClip(text);
+    if (requestedPart && /(?:second|two|zweite|zwei|2)\s*(?:part|teil)/i.test(text)) {
+      const siblings = timelineClips.filter(clip => clipBaseLabel(clip.label) === clipBaseLabel(requestedPart.label)).sort((a, b) => a.start - b.start);
+      const position = siblings.findIndex(clip => clip.id === requestedPart.id);
+      if (position > 0) return { before: siblings[position - 1], after: requestedPart };
+    }
+    const named = timelineClips.filter(clip => {
+      const base = clipBaseLabel(clip.label);
+      return base.length > 2 && text.includes(base);
+    }).sort((a, b) => text.indexOf(clipBaseLabel(a.label)) - text.indexOf(clipBaseLabel(b.label)));
+    if (named.length >= 2) return { before: named[0], after: named[1] };
+    const selected = selectedClipId ? timelineClips.find(clip => clip.id === selectedClipId) : null;
+    if (selected) {
+      const next = timelineClips.filter(clip => clip.id !== selected.id && clip.start >= selected.start).sort((a, b) => a.start - b.start)[0];
+      if (next) return { before: selected, after: next };
+    }
+    return null;
+  };
+  const findTransitionTrack = (before, after, start, clipsToCheck = timelineClips) => {
+    const isFree = trackIndex => !clipsToCheck.some(clip => clip.id !== after.id && clip.track === trackIndex && start < clip.start + clip.width - .001 && start + after.width > clip.start + .001);
+    const candidates = [after.track, ...trackList.map((_, index) => index)].filter((trackIndex, index, array) => trackIndex !== before.track && array.indexOf(trackIndex) === index);
+    return candidates.find(isFree);
+  };
+  const applyCrossfade = (before, after, duration, replacement = null) => {
+    const overlap = Math.min(duration, ((before.width / 100) * projectDuration) - .05, ((after.width / 100) * projectDuration) - .05);
+    if (overlap <= .05) return null;
+    const targetStart = before.start + before.width - (overlap / projectDuration) * 100;
+    const occupied = replacement ? timelineClips.filter(clip => clip.id !== replacement.id) : timelineClips;
+    const targetTrack = findTransitionTrack(before, after, targetStart, occupied);
+    if (targetTrack === undefined) return null;
+    const beforeFade = Math.min(40, (overlap / ((before.width / 100) * projectDuration)) * 100);
+    const afterFade = Math.min(40, (overlap / ((after.width / 100) * projectDuration)) * 100);
+    return { targetStart, targetTrack, overlap, beforeFade, afterFade };
+  };
+  const createCrossfade = (before, after, duration) => {
+    const transition = applyCrossfade(before, after, duration);
+    if (!transition) return null;
+    recordHistory();
+    setTimelineClips(current => current.map(clip => clip.id === after.id ? { ...clip, track: transition.targetTrack, start: transition.targetStart } : clip));
+    setFades(current => ({ ...current, [before.id]: { ...current[before.id], out: transition.beforeFade }, [after.id]: { ...current[after.id], in: transition.afterFade } }));
+    setSelectedClipId(after.id);
+    return transition;
+  };
+  const splitIntoCrossfade = (target, duration) => {
+    const source = target.clip;
+    const splitPoint = (target.time / projectDuration) * 100;
+    const leftWidth = splitPoint - source.start;
+    const rightWidth = source.width - leftWidth;
+    if (leftWidth <= 0 || rightWidth <= 0) return null;
+    const left = { ...source, id: `${source.id}-a`, width: leftWidth, label: `${source.label} · 1` };
+    const right = { ...source, id: `${source.id}-b`, start: splitPoint, width: rightWidth, label: `${source.label} · 2`, sourceOffset: (source.sourceOffset || 0) + ((leftWidth / 100) * projectDuration) };
+    const transition = applyCrossfade(left, right, duration, source);
+    if (!transition) return null;
+    recordHistory();
+    setTimelineClips(current => current.flatMap(clip => clip.id === source.id ? [left, { ...right, track: transition.targetTrack, start: transition.targetStart }] : clip));
+    setFades(current => ({ ...current, [left.id]: { in: current[source.id]?.in || 0, out: transition.beforeFade }, [right.id]: { in: transition.afterFade, out: current[source.id]?.out || 0 } }));
+    setSelectedClipId(right.id);
+    setPlaybackTime(target.time);
+    return transition;
+  };
+  const findOtherTransitionClip = (text, source, targetTrack = null) => {
+    const candidates = timelineClips.filter(clip => clip.id !== source.id && (targetTrack === null || clip.track === targetTrack));
+    const named = candidates.filter(clip => {
+      const base = clipBaseLabel(clip.label);
+      return base.length > 2 && text.includes(base);
+    });
+    return (named.length ? named : candidates).sort((a, b) => Math.abs(a.start - source.start) - Math.abs(b.start - source.start))[0] || null;
+  };
+  const splitWithOtherTrackTransition = (target, otherClip, destinationTrack, duration) => {
+    const source = target.clip;
+    if (destinationTrack === source.track) return null;
+    const splitPoint = (target.time / projectDuration) * 100;
+    const leftWidth = splitPoint - source.start;
+    const rightWidth = source.width - leftWidth;
+    const overlap = Math.min(duration, ((rightWidth / 100) * projectDuration) - .05, ((otherClip.width / 100) * projectDuration) - .05);
+    if (leftWidth <= 0 || rightWidth <= 0 || overlap <= .05) return null;
+    const hasCollision = timelineClips.some(clip => clip.id !== source.id && clip.id !== otherClip.id && clip.track === destinationTrack && splitPoint < clip.start + clip.width - .001 && splitPoint + otherClip.width > clip.start + .001);
+    if (hasCollision) return null;
+    const left = { ...source, id: `${source.id}-a`, width: leftWidth, label: `${source.label} · 1` };
+    const right = { ...source, id: `${source.id}-b`, start: splitPoint, width: rightWidth, label: `${source.label} · 2`, sourceOffset: (source.sourceOffset || 0) + ((leftWidth / 100) * projectDuration) };
+    const rightFade = Math.min(40, (overlap / ((right.width / 100) * projectDuration)) * 100);
+    const otherFade = Math.min(40, (overlap / ((otherClip.width / 100) * projectDuration)) * 100);
+    recordHistory();
+    setTimelineClips(current => current.flatMap(clip => {
+      if (clip.id === source.id) return [left, right];
+      if (clip.id === otherClip.id) return [{ ...clip, track: destinationTrack, start: splitPoint }];
+      return [clip];
+    }));
+    setFades(current => ({ ...current, [left.id]: { in: current[source.id]?.in || 0, out: 0 }, [right.id]: { in: 0, out: rightFade }, [otherClip.id]: { ...current[otherClip.id], in: otherFade } }));
+    setSelectedClipId(otherClip.id);
+    setPlaybackTime(target.time);
+    return { overlap, other: otherClip };
+  };
+  const moveClipToTrack = (clip, targetTrack) => {
+    const track = trackList[targetTrack];
+    if (!clip || !track) return null;
+    recordHistory();
+    setTimelineClips(current => {
+      const otherClips = current.filter(item => item.id !== clip.id && item.track === targetTrack).sort((a, b) => a.start - b.start);
+      const gaps = [];
+      let cursor = 0;
+      otherClips.forEach(item => {
+        if (item.start - cursor >= clip.width) gaps.push([cursor, item.start - clip.width]);
+        cursor = Math.max(cursor, item.start + item.width);
+      });
+      if (100 - cursor >= clip.width) gaps.push([cursor, 100 - clip.width]);
+      if (!gaps.length) return current;
+      const nextStart = gaps.map(([from, to]) => Math.max(from, Math.min(to, clip.start))).reduce((closest, point) => Math.abs(point - clip.start) < Math.abs(closest - clip.start) ? point : closest);
+      return current.map(item => item.id === clip.id ? { ...item, track: targetTrack, start: nextStart } : item);
+    });
+    setSelectedClipId(clip.id);
+    return track;
   };
   const executeAssistantCommand = (rawText) => {
     const text = rawText.toLowerCase();
     const commandTime = parseCommandTime(text);
-    if (/(schneid|teile|split)/.test(text)) {
-      if (commandTime === null) return "Nenne mir bitte eine Zeit, zum Beispiel: Schneide bei 1:20.";
-      const clip = timelineClips.find(item => {
-        const start = (item.start / 100) * projectDuration;
-        const end = ((item.start + item.width) / 100) * projectDuration;
-        return commandTime > start && commandTime < end;
-      });
-      if (!clip) return `Bei ${formatTime(commandTime)} liegt kein Clip. Ziehe den Clip erst an diese Stelle oder nenne eine Zeit innerhalb eines Clips.`;
-      setPlaybackTime(commandTime);
-      splitClipAtTime(clip.id, commandTime);
-      return `Erledigt: „${clip.label}“ wurde bei ${formatTime(commandTime)} geteilt.`;
+    const wantsTransition = /(cross.?fade|overlap|überblend|ueberblend|überlapp|ueberlapp|übergang|uebergang|transition|\bblend)/i.test(text);
+    const trackFromCommand = () => {
+      const number = parseTrackNumber(text);
+      if (number && trackList[number - 1]) return number - 1;
+      return selectedClipId ? timelineClips.find(clip => clip.id === selectedClipId)?.track ?? null : null;
+    };
+    if (/(unmute|un-mute|stumm\s*(?:aus|aufheben)|wieder\s*laut)/i.test(text)) {
+      const trackIndex = trackFromCommand();
+      if (trackIndex === null) return appLanguage === "de" ? "Nenne bitte eine Spur, zum Beispiel: „Spur 2 wieder laut schalten.“" : "Please name a track, for example: “Unmute track 2.”";
+      recordHistory();
+      setMuted(current => current.filter(index => index !== trackIndex));
+      return appLanguage === "de" ? `${trackList[trackIndex].name} ist wieder hörbar.` : `${trackList[trackIndex].name} is audible again.`;
+    }
+    if (/(?:\bmute\b|\bmuh\b|stumm(?:schalt| stellen)?)/i.test(text)) {
+      const trackIndex = trackFromCommand();
+      if (trackIndex === null) return appLanguage === "de" ? "Nenne bitte eine Spur, zum Beispiel: „Mute Spur 2.“" : "Please name a track, for example: “Mute track 2.”";
+      recordHistory();
+      setMuted(current => current.includes(trackIndex) ? current : [...current, trackIndex]);
+      return appLanguage === "de" ? `${trackList[trackIndex].name} ist stummgeschaltet.` : `${trackList[trackIndex].name} is muted.`;
+    }
+    if (/(?:\bsolo\b|allein(?:\s*hören)?)/i.test(text)) {
+      const trackIndex = trackFromCommand();
+      if (trackIndex === null) return appLanguage === "de" ? "Nenne bitte eine Spur, zum Beispiel: „Solo Spur 2.“" : "Please name a track, for example: “Solo track 2.”";
+      recordHistory();
+      setSolo([trackIndex]);
+      return appLanguage === "de" ? `${trackList[trackIndex].name} wird jetzt solo wiedergegeben.` : `${trackList[trackIndex].name} is now playing solo.`;
+    }
+    if (/(?:rückgängig|rueckgaengig|\bundo\b)/i.test(text)) {
+      if (!history.past.length) return appLanguage === "de" ? "Es gibt keinen Schritt zum Rückgängigmachen." : "There is no edit to undo.";
+      undo();
+      return appLanguage === "de" ? "Der letzte Schritt wurde rückgängig gemacht." : "The last edit was undone.";
+    }
+    if (/(?:\bredo\b|wiederhol(?:en)?)/i.test(text)) {
+      if (!history.future.length) return appLanguage === "de" ? "Es gibt keinen Schritt zum Wiederholen." : "There is no edit to redo.";
+      redo();
+      return appLanguage === "de" ? "Der Schritt wurde wiederholt." : "The edit was redone.";
+    }
+    if (/(?:reinzoom|zoom\s*(?:in|ein)|vergrößer|vergroesser)/i.test(text)) {
+      changeZoom(.5);
+      return appLanguage === "de" ? "Timeline vergrößert." : "Timeline zoomed in.";
+    }
+    if (/(?:rauszoom|zoom\s*(?:out|aus)|verkleiner)/i.test(text)) {
+      changeZoom(-.5);
+      return appLanguage === "de" ? "Timeline verkleinert." : "Timeline zoomed out.";
+    }
+    if (/(?:zum\s*anfang|an\s*den\s*anfang|go\s*to\s*(?:the\s*)?start|rewind|zurückspul|zurueckspul)/i.test(text)) {
+      restartTransport();
+      return appLanguage === "de" ? "Abspielkopf ist wieder am Anfang." : "The playhead is back at the start.";
+    }
+    if (/(?:abspielkopf|playhead)/i.test(text) && /(?:rechts|forward|vorwärts|vorwaerts|links|back)/i.test(text)) {
+      const seconds = Number(text.match(/(\d+(?:[.,]\d+)?)\s*(?:sekunde|sekunden|seconds?|secs?)/i)?.[1]?.replace(",", ".") || .25);
+      const direction = /(?:rechts|forward|vorwärts|vorwaerts)/i.test(text) ? 1 : -1;
+      setPlaybackTime(current => Math.max(0, Math.min(projectDuration, current + direction * seconds)));
+      return appLanguage === "de" ? `Abspielkopf um ${seconds} Sekunden ${direction > 0 ? "nach rechts" : "nach links"} bewegt.` : `Playhead moved ${seconds} seconds ${direction > 0 ? "forward" : "back"}.`;
+    }
+    if (/(?:pause|stop|anhalten)/i.test(text)) {
+      if (!playing && !activePreview) return appLanguage === "de" ? "Die Wiedergabe ist bereits angehalten." : "Playback is already paused.";
+      previewAudio.current?.pause(); setActivePreview(null); setPlaying(false);
+      return appLanguage === "de" ? "Wiedergabe angehalten." : "Playback paused.";
+    }
+    if (/(?:\bplay\b|abspiel|wiedergabe\s*(?:start|weiter)|starte\s*(?:die\s*)?wiedergabe)/i.test(text)) {
+      if (playing) return appLanguage === "de" ? "Die Wiedergabe läuft bereits." : "Playback is already running.";
+      toggleTransport();
+      return appLanguage === "de" ? "Wiedergabe gestartet." : "Playback started.";
+    }
+    if (/(?:\bdelete\b|lösche|loesche|entfern|\bremove\b)/i.test(text)) {
+      const clip = findCommandPartClip(text);
+      if (!clip) return appLanguage === "de" ? "Wähle bitte zuerst einen Clip aus oder nenne ihn." : "Select a clip first, or name it.";
+      removeClip(clip.id);
+      return appLanguage === "de" ? `„${clip.label}“ wurde gelöscht.` : `“${clip.label}” was deleted.`;
+    }
+    if (wantsTransition && /(schneid|teile|split|cut)/.test(text)) {
+      if (commandTime === null) return appLanguage === "de" ? "Nenne mir bitte die Schnittzeit, zum Beispiel: „Schneide bei 0:45 und überblende den zweiten Teil für 2 Sekunden.“" : "Please include the cut time, for example: “Split at 0:45 and crossfade the second part for 2 seconds.”";
+      const mentionedTracks = parseMentionedTrackNumbers(text);
+      const sourceTrack = mentionedTracks.length > 1 ? mentionedTracks[0] - 1 : null;
+      const destinationTrack = mentionedTracks.length > 1 ? mentionedTracks.at(-1) - 1 : null;
+      const target = resolveSplitTarget(text, commandTime, sourceTrack);
+      if (!target) return appLanguage === "de" ? `Bei ${formatTime(commandTime)} liegt kein teilbarer Clip. Nenne den Clip oder wähle eine Zeit innerhalb eines Clips.` : `There is no clip to split at ${formatTime(commandTime)}. Name the clip, or choose a time within one.`;
+      const otherClip = findOtherTransitionClip(text, target.clip, destinationTrack);
+      if (otherClip && destinationTrack !== null) {
+        const transition = splitWithOtherTrackTransition(target, otherClip, destinationTrack, transitionDurationFromCommand(text));
+        if (!transition) return appLanguage === "de" ? `Auf ${trackList[destinationTrack]?.name || "der gewünschten Spur"} ist an dieser Stelle kein freier Platz für die Überblendung.` : `There is no free space for that crossfade on ${trackList[destinationTrack]?.name || "the requested track"}.`;
+        return appLanguage === "de" ? `Erledigt: „${target.clip.label}“ auf ${trackList[target.clip.track]?.name} wurde bei ${formatTime(target.time)} geteilt. „${transition.other.label}“ liegt jetzt auf ${trackList[destinationTrack]?.name} darüber und überblendet sich für ${transition.overlap.toFixed(1)} Sekunden.` : `Done: “${target.clip.label}” on ${trackList[target.clip.track]?.name} was split at ${formatTime(target.time)}. “${transition.other.label}” now overlaps it on ${trackList[destinationTrack]?.name} for ${transition.overlap.toFixed(1)} seconds.`;
+      }
+      const transition = splitIntoCrossfade(target, transitionDurationFromCommand(text));
+      if (!transition) return appLanguage === "de" ? "Ich finde keine freie Spur für diese Überblendung. Erstelle eine freie Spur und versuche es erneut." : "I could not find a free track for this crossfade. Add an empty track and try again.";
+      return appLanguage === "de" ? `Erledigt: „${target.clip.label}“ wurde bei ${formatTime(target.time)} geteilt und die beiden Teile überblenden sich jetzt für ${transition.overlap.toFixed(1)} Sekunden.` : `Done: “${target.clip.label}” was split at ${formatTime(target.time)} and its parts now crossfade for ${transition.overlap.toFixed(1)} seconds.`;
+    }
+    if (wantsTransition) {
+      const pair = findTransitionPair(text);
+      if (!pair) return appLanguage === "de" ? "Nenne zwei Clips, zum Beispiel: „Überblende Sample Song mit Drum Beat für 2 Sekunden“, oder wähle den ersten Clip aus." : "Name two clips, for example: “Crossfade Sample Song into Drum Beat for 2 seconds,” or select the first clip.";
+      const transition = createCrossfade(pair.before, pair.after, transitionDurationFromCommand(text));
+      if (!transition) return appLanguage === "de" ? "Ich finde keine freie Spur für diese Überblendung. Erstelle eine freie Spur und versuche es erneut." : "I could not find a free track for this crossfade. Add an empty track and try again.";
+      return appLanguage === "de" ? `Erledigt: „${pair.after.label}“ überblendet sich jetzt ${transition.overlap.toFixed(1)} Sekunden mit „${pair.before.label}“ auf ${trackList[transition.targetTrack]?.name}.` : `Done: “${pair.after.label}” now crossfades with “${pair.before.label}” for ${transition.overlap.toFixed(1)} seconds on ${trackList[transition.targetTrack]?.name}.`;
+    }
+    if (/(schneid|teile|split|cut)/.test(text)) {
+      if (commandTime === null && /(?:abspielkopf|playhead|current\s*position|aktuelle\s*position)/i.test(text)) {
+        const clip = selectedClipId ? timelineClips.find(item => item.id === selectedClipId) : timelineClips.find(item => playbackTime > (item.start / 100) * projectDuration && playbackTime < ((item.start + item.width) / 100) * projectDuration);
+        if (!clip) return appLanguage === "de" ? "Der Abspielkopf liegt auf keinem teilbaren Clip." : "The playhead is not on a clip that can be split.";
+        splitClipAtTime(clip.id, playbackTime);
+        return appLanguage === "de" ? `Erledigt: „${clip.label}“ wurde an der Abspielposition geteilt.` : `Done: “${clip.label}” was split at the playhead.`;
+      }
+      if (commandTime === null) return appLanguage === "de" ? "Nenne mir bitte eine Zeit, zum Beispiel: Schneide bei 1:20." : "Please include a time, for example: Split at 1:20.";
+      const target = resolveSplitTarget(text, commandTime);
+      if (!target) return appLanguage === "de" ? `Bei ${formatTime(commandTime)} liegt kein teilbarer Clip. Nenne den Clip oder wähle eine Zeit innerhalb eines Clips.` : `There is no clip to split at ${formatTime(commandTime)}. Name the clip, or choose a time within one.`;
+      setPlaybackTime(target.time);
+      splitClipAtTime(target.clip.id, target.time);
+      return appLanguage === "de" ? `Erledigt: „${target.clip.label}“ wurde bei ${formatTime(target.time)} geteilt.` : `Done: “${target.clip.label}” was split at ${formatTime(target.time)}.`;
+    }
+    if (/(verschieb|move|place|put)/.test(text)) {
+      const trackNumber = parseTrackNumber(text);
+      const clip = findCommandPartClip(text);
+      if (!clip) return appLanguage === "de" ? "Ich finde den genannten Clip-Teil nicht. Wähle ihn aus oder nenne zum Beispiel „zweiten Teil“." : "I could not find that clip part. Select it, or name it, for example “the second part”.";
+      if (!trackNumber || !trackList[trackNumber - 1]) return appLanguage === "de" ? "Nenne bitte eine Zielspur, zum Beispiel: „Verschiebe den zweiten Teil auf Spur 3“." : "Please name a destination track, for example: “Move the second part to track 3”.";
+      const track = moveClipToTrack(clip, trackNumber - 1);
+      if (!track) return appLanguage === "de" ? "Auf dieser Spur ist nicht genug freier Platz für den Clip." : "There is not enough free space for that clip on this track.";
+      return appLanguage === "de" ? `Erledigt: „${clip.label}“ wurde auf ${track.name} verschoben.` : `Done: “${clip.label}” was moved to ${track.name}.`;
     }
     if (/(fade.?out|ausblend|ausfaden)/.test(text) || /(fade.?in|einblend|einfaden)/.test(text)) {
       const clip = selectedClipId ? timelineClips.find(item => item.id === selectedClipId) : timelineClips.find(item => {
@@ -1476,15 +2158,57 @@ function App() {
         const end = ((item.start + item.width) / 100) * projectDuration;
         return playbackTime >= start && playbackTime <= end;
       });
-      if (!clip) return "Wähle zuerst einen Clip aus oder setze den Abspielkopf auf einen Clip.";
+      if (!clip) return appLanguage === "de" ? "Wähle zuerst einen Clip aus oder setze den Abspielkopf auf einen Clip." : "Select a clip first, or place the playhead on a clip.";
       const duration = (clip.width / 100) * projectDuration;
       const secondMatch = text.match(/(\d+)\s*(?:sekunde|sekunden|sek)/i);
       const percent = Math.min(40, Math.max(1, ((Number(secondMatch?.[1] || 3) / duration) * 100)));
       const edge = /(fade.?out|ausblend|ausfaden)/.test(text) ? "out" : "in";
       setFade(clip.id, edge, percent);
-      return `Erledigt: ${edge === "out" ? "Fade-out" : "Fade-in"} für „${clip.label}“ wurde auf ${Math.round(Number(secondMatch?.[1] || 3))} Sekunden gesetzt.`;
+      return appLanguage === "de" ? `Erledigt: ${edge === "out" ? "Fade-out" : "Fade-in"} für „${clip.label}“ wurde auf ${Math.round(Number(secondMatch?.[1] || 3))} Sekunden gesetzt.` : `Done: ${edge === "out" ? "Fade-out" : "Fade-in"} for “${clip.label}” is now ${Math.round(Number(secondMatch?.[1] || 3))} seconds.`;
     }
-    return "Das kann ich schon verstehen: „Schneide bei 1:20“, „Fade-out für 3 Sekunden“ oder „Fade-in für 2 Sekunden“.";
+    return appLanguage === "de" ? "Diesen Befehl kann ich noch nicht sicher ausführen. Lade Local AI direkt unter dem Eingabefeld, um ihn lokal zu verstehen." : "I cannot safely run that command yet. Load Local AI directly below this input to understand it locally.";
+  };
+  const executeLocalAiAction = (raw, error) => {
+    if (error) return appLanguage === "de" ? "Das lokale Modell konnte diese Anfrage nicht verarbeiten. Du kannst es erneut versuchen oder einen der kurzen Befehle verwenden." : "The local model could not process that request. Try again or use a shorter command.";
+    const match = String(raw || "").match(/\{[\s\S]*\}/);
+    let action;
+    try { action = JSON.parse(match?.[0] || ""); } catch { return appLanguage === "de" ? "Ich konnte daraus keine sichere Editor-Aktion ableiten. Formuliere es bitte zum Beispiel als „Schneide bei 1:20“ oder „Fade-out für 3 Sekunden“." : "I could not derive a safe editor action. Try “Split at 1:20” or “Fade out for 3 seconds”."; }
+    if (action.action === "split") {
+      const time = Number(action.time_seconds);
+      const clip = timelineClips.find(item => time > (item.start / 100) * projectDuration && time < ((item.start + item.width) / 100) * projectDuration);
+      if (!Number.isFinite(time) || !clip) return appLanguage === "de" ? "An dieser Stelle liegt kein teilbarer Clip." : "There is no clip to split at that position.";
+      setPlaybackTime(time);
+      splitClipAtTime(clip.id, time);
+      return appLanguage === "de" ? `Erledigt: „${clip.label}“ wurde bei ${formatTime(time)} geteilt.` : `Done: “${clip.label}” was split at ${formatTime(time)}.`;
+    }
+    if (action.action === "fade" && ["in", "out"].includes(action.edge)) {
+      const clip = selectedClipId ? timelineClips.find(item => item.id === selectedClipId) : timelineClips.find(item => playbackTime >= (item.start / 100) * projectDuration && playbackTime <= ((item.start + item.width) / 100) * projectDuration);
+      if (!clip) return appLanguage === "de" ? "Wähle zuerst einen Clip aus oder positioniere den Abspielkopf auf einem Clip." : "Select a clip first, or place the playhead on a clip.";
+      const clipDuration = (clip.width / 100) * projectDuration;
+      const seconds = Math.max(.1, Math.min(Number(action.seconds) || 3, clipDuration));
+      setFade(clip.id, action.edge, Math.min(40, Math.max(1, (seconds / clipDuration) * 100)));
+      const name = action.edge === "in" ? "Fade-in" : "Fade-out";
+      return appLanguage === "de" ? `Erledigt: ${name} für „${clip.label}“ wurde auf ${Math.round(seconds)} Sekunden gesetzt.` : `Done: ${name} for “${clip.label}” is now ${Math.round(seconds)} seconds.`;
+    }
+    if (action.action === "move") {
+      const clip = timelineClips.find(item => item.id === action.clip_id);
+      const targetTrack = Number(action.track_number) - 1;
+      if (!clip || !Number.isInteger(targetTrack) || !trackList[targetTrack]) return appLanguage === "de" ? "Ich konnte Clip oder Zielspur nicht sicher zuordnen." : "I could not safely identify the clip or destination track.";
+      const track = moveClipToTrack(clip, targetTrack);
+      if (!track) return appLanguage === "de" ? "Auf dieser Spur ist nicht genug freier Platz für den Clip." : "There is not enough free space for that clip on this track.";
+      return appLanguage === "de" ? `Erledigt: „${clip.label}“ wurde auf ${track.name} verschoben.` : `Done: “${clip.label}” was moved to ${track.name}.`;
+    }
+    return appLanguage === "de" ? "Ich habe keine sichere Aktion dafür. Aktuell kann Local AI Clips teilen sowie Fade-ins und Fade-outs setzen." : "I do not have a safe action for that yet. Local AI can currently split clips and set fade-ins or fade-outs.";
+  };
+  useEffect(() => {
+    if (!localAiRequest || (!localAiRequest.result && !localAiRequest.error)) return;
+    const reply = executeLocalAiAction(localAiRequest.result, localAiRequest.error);
+    setMessages(current => current.map(message => message.pending === localAiRequest.id ? { role: "ai", text: reply } : message));
+    setLocalAiRequest(null);
+  }, [localAiRequest]);
+  const activateLocalAi = () => {
+    setLocalAiProgress(0);
+    localAiWorkerRef.current?.postMessage({ type: "load", model: localAiModel });
   };
   const startClipDrag = (event, clip) => {
     recordHistory();
@@ -1676,7 +2400,7 @@ function App() {
             output.connect(shaper); output = shaper;
           }
           const gain = offline.createGain();
-          const fullVolume = (trackVolumes[clip.track] ?? 75) / 100;
+          const fullVolume = ((trackVolumes[clip.track] ?? 75) / 100) * (clip.gain ?? 1);
           const fade = fades[clip.id] || {};
           const fadeIn = clipDuration * ((fade.in || 0) / 100);
           const fadeOut = clipDuration * ((fade.out || 0) / 100);
@@ -1759,10 +2483,23 @@ function App() {
     </section>
     <aside className="ai-panel">
       <header><div className="ai-title"><div className="ai-star"><Sparkles size={16}/></div><span>flow AI</span><em>BETA</em></div><button onClick={() => setAiPanelOpen(false)} title={t("closeAi")}><X size={18}/></button></header>
+      <div className="local-ai-control">
+        <div><b>Local AI</b><small>{localAiStatus === "ready" ? (appLanguage === "de" ? `Bereit · ${localAiDevice === "webgpu" ? "WebGPU" : "lokaler Modus"}` : `Ready · ${localAiDevice === "webgpu" ? "WebGPU" : "local mode"}`) : localAiModel === "smart" ? (appLanguage === "de" ? "Smart-Modell · ca. 0,9 GB mit WebGPU" : "Smart model · about 0.9 GB with WebGPU") : (appLanguage === "de" ? "Läuft nur auf diesem Gerät" : "Runs only on this device")}</small></div>
+        <select value={localAiModel} disabled={localAiStatus === "loading" || localAiStatus === "thinking"} onChange={event => { window.localStorage.removeItem("flowtape-local-ai-enabled"); setLocalAiModel(event.target.value); setLocalAiStatus("idle"); setLocalAiProgress(0); }}><option value="lite">Lite · Qwen 0.5B</option><option value="standard">Standard · Qwen 0.6B</option><option value="smart">Smart · Gemma 3 1B</option></select>
+        {localAiStatus !== "ready" && <button onClick={activateLocalAi} disabled={localAiStatus === "loading" || localAiStatus === "thinking"}>{localAiStatus === "loading" ? <span className="local-loader"><LoaderCircle size={13}/>{appLanguage === "de" ? "Wird lokal vorbereitet …" : "Preparing locally …"}</span> : (appLanguage === "de" ? "Lokal starten" : "Start locally")}</button>}
+      </div>
+      <div className="local-audio-tools">
+        <button className="mix-check-trigger" onClick={runMixCheck}><Sparkles size={13}/>{appLanguage === "de" ? "Meinen Mix prüfen" : "Check my mix"}</button>
+        {mixCheck && <div className="mix-check-results">{mixCheck.suggestions.map(suggestion => <article key={suggestion.id}><div><b>{suggestion.title}</b><p>{suggestion.body}</p></div>{suggestion.apply && <button onClick={() => applyMixSuggestion(suggestion)}>{suggestion.apply}</button>}</article>)}</div>}
+        <button onClick={previewLevelMatch} disabled={matchingLevels}>{matchingLevels ? (appLanguage === "de" ? "Lautstärken werden geprüft …" : "Checking levels …") : (appLanguage === "de" ? "Lautstärken angleichen" : "Match levels")}</button>
+        {levelMatchPreview && <div className="level-match-results"><div><b>{appLanguage === "de" ? "Ziel-Lautstärke" : "Target level"}: {levelMatchPreview.targetDb.toFixed(1)} dB</b><small>{appLanguage === "de" ? "Die Originaldateien bleiben unverändert." : "Your original files stay unchanged."}</small></div><ul>{levelMatchPreview.adjustments.slice(0, 4).map(adjustment => <li key={adjustment.clipId}><span>{adjustment.label}</span><em>{adjustment.changeDb >= 0 ? "+" : ""}{adjustment.changeDb.toFixed(1)} dB</em></li>)}</ul><div className="level-match-actions"><button onClick={() => setLevelMatchPreview(null)}>{appLanguage === "de" ? "Abbrechen" : "Cancel"}</button><button onClick={applyLevelMatch}>{appLanguage === "de" ? "Anwenden" : "Apply"}</button></div></div>}
+        <button onClick={analyzeSelectedAudio} disabled={analyzingAudio}>{analyzingAudio ? (appLanguage === "de" ? "Analysiere ausgewählten Clip …" : "Analysing selected clip …") : (appLanguage === "de" ? "Ausgewählten Clip analysieren" : "Analyse selected clip")}</button>
+        {audioAnalysis && <div className="analysis-results"><span>{audioAnalysis.bpm ? `${audioAnalysis.bpm} BPM` : "— BPM"}</span><span>{audioAnalysis.loudnessDb} dB</span>{audioAnalysis.silentSections.length > 0 && <small>{appLanguage === "de" ? `${audioAnalysis.silentSections.length} Stille-Abschnitt${audioAnalysis.silentSections.length > 1 ? "e" : ""} erkannt` : `${audioAnalysis.silentSections.length} silent section${audioAnalysis.silentSections.length > 1 ? "s" : ""} found`}</small>}<div><button className="apply-analysis-bpm" onClick={() => { if (audioAnalysis.bpm) { setBpm(audioAnalysis.bpm); notify(appLanguage === "de" ? `${audioAnalysis.bpm} BPM übernommen` : `${audioAnalysis.bpm} BPM applied`); } }} disabled={!audioAnalysis.bpm}>{appLanguage === "de" ? "Tempo übernehmen" : "Use tempo"}</button><button className="apply-analysis-bpm beat-snap-button" onClick={snapSelectedClipToBeat} disabled={audioAnalysis.clipId !== selectedClipId || !audioAnalysis.beatTimes?.length}>{appLanguage === "de" ? "Auf Beat einrasten" : "Snap to beat"}</button></div></div>}
+      </div>
       <div className="ai-intro"><div className="ai-orb"><span></span></div><h2>{t("ideaTitle")}</h2><p>{t("aiLead")}</p></div>
       <div className="quick-ideas"><button onClick={() => submitPrompt("Mach den Übergang zum Refrain weicher")}>Mach den Übergang zum Refrain weicher <ChevronRight size={15}/></button><button onClick={() => submitPrompt("Schneide die Stille vor dem Drop weg")}>Schneide die Stille vor dem Drop weg <ChevronRight size={15}/></button><button onClick={() => submitPrompt("Gib dem Mix mehr Wärme")}>Gib dem Mix mehr Wärme <ChevronRight size={15}/></button></div>
       <div className="chat">{messages.map((message, i) => <div key={i} className={`message ${message.role}`}><span>{message.role === "ai" ? "✦" : "S"}</span><p>{message.text}</p></div>)}</div>
-      <div className="prompt-box"><textarea value={prompt} onChange={e => setPrompt(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submitPrompt(); } }} placeholder={t("describeChange")}/><div><button className={listening ? "mic mic-listening" : "mic"} onClick={startVoiceInput}><Mic size={17}/><span>{listening ? t("listening") : t("speak")}</span></button><button className="send" onClick={() => submitPrompt()} disabled={!prompt.trim()}><ArrowDownToLine size={17}/></button></div></div>
+      <div className="prompt-box"><textarea value={prompt} onChange={e => setPrompt(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey && localAiStatus !== "thinking") { e.preventDefault(); submitPrompt(); } }} placeholder={t("describeChange")}/>{localAiStatus !== "ready" && <button className="local-ai-inline-load" onClick={activateLocalAi} disabled={localAiStatus === "loading" || localAiStatus === "thinking"}>{localAiStatus === "loading" ? <span className="local-loader"><LoaderCircle size={13}/>{appLanguage === "de" ? "Local AI wird vorbereitet …" : "Preparing Local AI …"}</span> : (appLanguage === "de" ? "Local AI starten" : "Start Local AI")}</button>}<div><button className={listening ? "mic mic-listening" : "mic"} onClick={startVoiceInput} disabled={voiceAiStatus === "loading" || voiceAiStatus === "transcribing"}>{voiceAiStatus === "loading" || voiceAiStatus === "transcribing" ? <LoaderCircle className="local-loader-icon" size={17}/> : <Mic size={17}/>}<span>{listening ? (appLanguage === "de" ? "Aufnahme stoppen" : "Stop recording") : voiceAiStatus === "loading" ? (appLanguage === "de" ? "Sprache wird vorbereitet …" : "Preparing voice …") : voiceAiStatus === "transcribing" ? (appLanguage === "de" ? "Transkribiere …" : "Transcribing …") : (appLanguage === "de" ? "Lokal sprechen" : "Speak locally")}</span></button><button className="send" onClick={() => submitPrompt()} disabled={!prompt.trim() || localAiStatus === "thinking"}><ArrowDownToLine size={17}/></button></div></div>
     </aside>
     {contextMenu && <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onMouseLeave={() => setContextMenu(null)}><button onClick={() => splitClipAtPlayhead(contextMenu.clipId)}><Scissors size={15}/> {t("splitAtPlayhead")}</button><span/><button onClick={() => copyClip(contextMenu.clipId, true)}><Scissors size={15}/> {t("cut")}</button><button onClick={() => copyClip(contextMenu.clipId)}><Copy size={15}/> {t("copy")}</button><span/><button className="danger" onClick={() => removeClip(contextMenu.clipId)}><Trash2 size={15}/> {t("delete")}</button></div>}
     {trackContextMenu && <div className="context-menu track-context-menu" style={{ left: trackContextMenu.x, top: trackContextMenu.y }} onMouseLeave={() => setTrackContextMenu(null)}><button onClick={() => duplicateTrack(trackContextMenu.index)}><Copy size={15}/> {t("duplicateTrack")}</button><span/><button className="danger" onClick={() => deleteTrack(trackContextMenu.index)}><Trash2 size={15}/> {t("deleteTrack")}</button></div>}
@@ -1773,6 +2510,7 @@ function App() {
     {welcomeOpen && <div className="project-modal-backdrop welcome-backdrop"><form className="project-modal welcome-modal" onSubmit={event => { event.preventDefault(); finishWelcome(); }}><div className="welcome-mark"><span className="brand-mark">f</span></div><div className="eyebrow">FLOWTAPE STUDIO</div><h2>Welcome to flowtape</h2><p>What should we call you?</p><input className="welcome-name-input" autoFocus value={welcomeNameDraft} onChange={event => setWelcomeNameDraft(event.target.value)} placeholder="Your name"/><div className="modal-actions"><button className="modal-primary" type="submit">Let’s go</button></div></form></div>}
     {settingsOpen && <div className="project-modal-backdrop" onPointerDown={() => setSettingsOpen(false)}><section className="project-modal settings-modal" onPointerDown={event => event.stopPropagation()}><button type="button" className="modal-close" onClick={() => setSettingsOpen(false)}><X size={18}/></button><h2>{t("settings")}</h2><p>{t("settingsLead")}</p><div className="settings-row"><div><b>{t("language")}</b><small>{t("interfaceLanguage")}</small></div><div className="settings-segment"><button className={appLanguage === "de" ? "selected" : ""} onClick={() => setAppLanguage("de")}>Deutsch</button><button className={appLanguage === "en" ? "selected" : ""} onClick={() => setAppLanguage("en")}>English</button></div></div><div className="settings-row"><div><b>{t("defaultTracks")}</b><small>{t("defaultTracksLead")}</small></div><div className="track-count-stepper"><button onClick={() => setDefaultTrackCount(value => Math.max(1, value - 1))} disabled={defaultTrackCount <= 1}>−</button><b>{defaultTrackCount}</b><button onClick={() => setDefaultTrackCount(value => Math.min(8, value + 1))} disabled={defaultTrackCount >= 8}>+</button></div></div><div className="settings-row"><div><b>{t("exportFormats")}</b><small>{t("exportFormatsLead")}</small></div><div className="settings-segment"><button className={exportFormat === "wav" ? "selected" : ""} onClick={() => setExportFormat("wav")}>WAV</button><button className={exportFormat === "mp3" ? "selected" : ""} onClick={() => setExportFormat("mp3")}>MP3</button></div></div><div className="modal-actions"><button className="modal-primary" onClick={() => { setSettingsOpen(false); notify("Einstellungen gespeichert"); }}>{t("done")}</button></div></section></div>}
     {shortcutsOpen && <div className="project-modal-backdrop" onPointerDown={() => setShortcutsOpen(false)}><section className="project-modal shortcuts-modal" onPointerDown={event => event.stopPropagation()}><button type="button" className="modal-close" onClick={() => setShortcutsOpen(false)}><X size={18}/></button><div className="eyebrow">{shortcutsCopy.eyebrow}</div><h2>{shortcutsCopy.title}</h2><p>{shortcutsCopy.lead}</p><div className="shortcuts-list">{shortcutsCopy.rows.map(([shortcut, description]) => <div key={shortcut}><kbd>{shortcut}</kbd><span>{description}</span></div>)}</div><div className="modal-actions"><button className="modal-primary" onClick={() => setShortcutsOpen(false)}>{shortcutsCopy.close}</button></div></section></div>}
+    {isDesktopApp() && availableUpdate && <button className="update-button" onClick={installAvailableUpdate} disabled={updateStatus === "downloading"} title={availableUpdate.notes || (appLanguage === "de" ? "Update installieren" : "Install update")}><Download size={15}/>{updateStatus === "downloading" ? (updateProgress ? `${updateProgress}%` : (appLanguage === "de" ? "Lädt …" : "Downloading …")) : `Update ${availableUpdate.version}`}</button>}
     {toast && <div className="toast"><Sparkles size={15}/>{toast}</div>}
   </main>;
 }
