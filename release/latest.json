@@ -4,11 +4,11 @@
   "pub_date": "2026-08-29T12:00:00Z",
   "platforms": {
     "darwin-aarch64": {
-      "url": "https://github.com/SandroIeva/flowtape/releases/download/app-v0.1.1/Flowtape%20Studio.app.tar.gz",
+      "url": "https://github.com/SandroIeva/flowtape/releases/download/app-v0.1.1/Flowtape.Studio.app.tar.gz",
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRRkV6a1NGZGhsTWEwcCtOMWs1c2U2UDh2bzFTS25OSjA4ZllEYnJwSlVQekd2ZTkxbWRWMHMvNkUyc3o1RFhuMmNMd1ZRUG1NTjJtZi9OcnI2ZTlGeVYzZkJCSjdZWEFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4MDAxNzczCWZpbGU6Rmxvd3RhcGUgU3R1ZGlvLmFwcC50YXIuZ3oKZ3FoLzg5cS9mSW5kVnVLdStlNU01U1FDdzBWQnMxTGY4eG1TNm13MUdIeTl3OENtRzhqS25EOVdwOE05emlOcWFFQklRWkRtc05LWjA2Y3FIaUpkQ3c9PQo="
     },
     "darwin-x86_64": {
-      "url": "https://github.com/SandroIeva/flowtape/releases/download/app-v0.1.1/Flowtape%20Studio.app.tar.gz",
+      "url": "https://github.com/SandroIeva/flowtape/releases/download/app-v0.1.1/Flowtape.Studio.app.tar.gz",
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRRkV6a1NGZGhsTWEwcCtOMWs1c2U2UDh2bzFTS25OSjA4ZllEYnJwSlVQekd2ZTkxbWRWMHMvNkUyc3o1RFhuMmNMd1ZRUG1NTjJtZi9OcnI2ZTlGeVYzZkJCSjdZWEFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg4MDAxNzczCWZpbGU6Rmxvd3RhcGUgU3R1ZGlvLmFwcC50YXIuZ3oKZ3FoLzg5cS9mSW5kVnVLdStlNU01U1FDdzBWQnMxTGY4eG1TNm13MUdIeTl3OENtRzhqS25EOVdwOE05emlOcWFFQklRWkRtc05LWjA2Y3FIaUpkQ3c9PQo="
     }
   }
